@@ -16,6 +16,7 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 #include "Core/Config.h"
 #include "Core/MIPS/MIPS.h"
+#include "Core/MIPS/MIPSTables.h"
 
 #include "ArmJit.h"
 #include "ArmRegCache.h"
@@ -52,7 +53,89 @@ void Jit::Comp_FPU3op(u32 op)
 	{
 	case 0: VADD(fpr.R(fd), fpr.R(fs), fpr.R(ft)); break; //F(fd) = F(fs) + F(ft); //add
 	case 1: VSUB(fpr.R(fd), fpr.R(fs), fpr.R(ft)); break; //F(fd) = F(fs) - F(ft); //sub
-	case 2: VMUL(fpr.R(fd), fpr.R(fs), fpr.R(ft)); break; //F(fd) = F(fs) * F(ft); //mul
+	case 2: { //F(fd) = F(fs) * F(ft); //mul
+		// Attempt optimise if destination is used again
+		u32 nextOp = Memory::Read_Instruction(js.compilerPC + 4);
+		int next_fd = ((nextOp>>6) & 0x1F);
+		if (fd == next_fd && fd != fs && fd != ft) {
+			u32 futureOp = Memory::Read_Instruction(js.compilerPC + 8);
+			int future_fd = ((futureOp>>6) & 0x1F);
+			const char* next_name = MIPSGetName(nextOp);
+			const char* future_name = MIPSGetName(futureOp);
+			// MUL + NEG -> VNMUL
+			if (next_name == "neg.s") {
+				int next_fs = ((nextOp>>11) & 0x1F);
+				if (fd == next_fs) {
+					VNMUL(fpr.R(fd), fpr.R(fs), fpr.R(ft));
+					EatInstruction(nextOp);
+				}
+				return;
+			}
+			// MUL + (ADD|SUB) + (ADD|SUB) -> V(ADD|SUB) + V(N)ML(A|S)
+			else if ((next_name == "add.s" || next_name == "sub.s") && fd == future_fd &&
+				(future_name == "add.s" || future_name == "sub.s") )
+			{
+				int next_ft = ((nextOp>>16) & 0x1F);
+				int next_fs = ((nextOp>>11) & 0x1F);
+				int future_ft = ((futureOp>>16) & 0x1F);
+				int future_fs = ((futureOp>>11) & 0x1F);
+				// Check if we need to continue. Maybe dest isn't used in future
+				if (fd != future_fs && fd != future_ft) {
+					EatInstruction(nextOp);
+					return;
+				} else if (fd != next_fs && fd != next_ft)
+					return;
+
+				if ((future_fs == future_ft) || (next_fs == next_ft)) {
+					VMUL(fpr.R(fd), fpr.R(fs), fpr.R(ft));
+					return;
+				}
+
+				int next_reg = (fd == next_fs) ? next_ft : next_fs;
+				int future_reg = (fd == future_fs) ? future_ft : future_fs;
+
+				void (ARMXEmitter::*first_op)(ARMReg Vd, ARMReg Vn, ARMReg Vm) = NULL;
+				void (ARMXEmitter::*second_op)(ARMReg Vd, ARMReg Vn, ARMReg Vm) = NULL;
+				switch((nextOp & 0x3f) | ((futureOp & 0x3f) << 1))
+				{       // NextOp   FutureOp
+				case 0: // ADD      ADD
+					first_op  = &ARMXEmitter::VADD;
+					second_op = &ARMXEmitter::VMLA;
+				break;
+				case 1: // SUB      ADD
+					if (fd == next_ft) {
+						first_op  = &ARMXEmitter::VADD;
+						second_op = &ARMXEmitter::VMLS;
+					} else {
+						first_op  = &ARMXEmitter::VSUB;
+						second_op = &ARMXEmitter::VNMLS;
+					}
+				break;
+				case 2: // ADD      SUB
+					first_op  = &ARMXEmitter::VSUB; 
+					second_op = (fd == future_fs) ? &ARMXEmitter::VMLA : &ARMXEmitter::VNMLA;
+				break;
+				case 3: // SUB      SUB
+					if (fd == next_ft)
+						first_op = &ARMXEmitter::VSUB;
+					else
+						first_op = &ARMXEmitter::VADD;
+					second_op = (fd == next_ft ? fd == future_fs : fd == future_ft) ? &ARMXEmitter::VMLS : &ARMXEmitter::VNMLS;
+				break;
+				}
+				// TODO: What's wrong here with VM*(S/A)?!
+
+				fpr.MapInIn(next_reg, future_reg);
+				(this->*first_op)(fpr.R(fd), fpr.R(next_reg), fpr.R(future_reg));
+				(this->*second_op)(fpr.R(fd), fpr.R(fs), fpr.R(ft));
+				EatInstruction(nextOp);
+				EatInstruction(futureOp);
+				return;
+			}
+		}
+		VMUL(fpr.R(fd), fpr.R(fs), fpr.R(ft));
+	}
+	break;
 	case 3: VDIV(fpr.R(fd), fpr.R(fs), fpr.R(ft)); break; //F(fd) = F(fs) / F(ft); //div
 	default:
 		DISABLE;
